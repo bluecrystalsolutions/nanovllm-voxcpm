@@ -23,6 +23,8 @@ from numpy.typing import NDArray
 
 Waveform = NDArray[np.float32]
 
+_WORKER_DEAD = object()  # Sentinel pushed to async queue when worker process dies
+
 
 class HealthResponse(TypedDict):
     status: Literal["ok"]
@@ -345,6 +347,7 @@ class AsyncVoxCPMServer:
         # but still fail fast if init throws (e.g. CUDA OOM).
         loop = asyncio.get_running_loop()
         self._init_fut: asyncio.Future[None] = loop.create_future()
+        self._worker_dead = False
 
         self.op_table: dict[str, asyncio.Future[Any]] = {}
         self.stream_table: dict[str, asyncio.Queue[Waveform | None]] = {}
@@ -364,8 +367,14 @@ class AsyncVoxCPMServer:
             try:
                 res = self.queue_out.get(timeout=0.1)
             except Empty:
+                # Check if the worker process died while we were waiting.
+                if self.process.exitcode is not None and not self._queue_out_stop.is_set():
+                    loop.call_soon_threadsafe(self._queue_out_async.put_nowait, _WORKER_DEAD)
+                    return
                 continue
             except (EOFError, OSError, ValueError):
+                if not self._queue_out_stop.is_set():
+                    loop.call_soon_threadsafe(self._queue_out_async.put_nowait, _WORKER_DEAD)
                 return
             try:
                 loop.call_soon_threadsafe(self._queue_out_async.put_nowait, res)
@@ -376,6 +385,16 @@ class AsyncVoxCPMServer:
         try:
             while True:
                 res = await self._queue_out_async.get()
+
+                if res is _WORKER_DEAD:
+                    self._worker_dead = True
+                    for op_id, fut in list(self.op_table.items()):
+                        if not fut.done():
+                            fut.set_exception(RuntimeError("VoxCPM worker process died unexpectedly"))
+                    self.op_table.clear()
+                    if not self._init_fut.done():
+                        self._init_fut.set_exception(RuntimeError("VoxCPM worker process died unexpectedly"))
+                    return
 
                 # Init handshake (sent once at process startup).
                 if res.get("type") == "init_ok":
@@ -407,6 +426,8 @@ class AsyncVoxCPMServer:
             return
 
     async def submit(self, cmd: str, *args: object, **kwargs: object) -> Any:
+        if self._worker_dead:
+            raise RuntimeError("VoxCPM worker process died unexpectedly — server must be restarted")
         op_id = str(uuid.uuid4())
 
         loop = asyncio.get_running_loop()
