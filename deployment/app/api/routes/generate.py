@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import inspect
+import logging
 import time
 from typing import Any, AsyncIterator
 
@@ -18,6 +19,8 @@ from app.core.metrics import (
 )
 from app.schemas.http import ErrorResponse, GenerateRequest
 from app.services.mp3 import stream_mp3, stream_pcm
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["generation"])
 
@@ -198,6 +201,27 @@ async def generate(
         if "seed" not in generate_params:
             raise HTTPException(status_code=400, detail="Seed is not supported by the loaded model")
 
+    # --- Diagnostic logging: request dimensions ---
+    latents_len = len(prompt_latents) // 4 if prompt_latents else 0  # float32 count
+    ref_latents_len = len(ref_audio_latents) // 4 if ref_audio_latents else 0
+    logger.info(
+        "/generate: target_text=%r (%d chars), prompt_text=%r (%d chars), "
+        "latents=%d floats, ref_latents=%d floats, max_generate_length=%d, "
+        "temperature=%.2f, cfg_value=%.2f, lora=%s, seed=%s, format=%s",
+        req.target_text[:60],
+        len(req.target_text),
+        (prompt_text[:40] + "...") if len(prompt_text) > 40 else prompt_text,
+        len(prompt_text),
+        latents_len,
+        ref_latents_len,
+        req.max_generate_length,
+        req.temperature,
+        req.cfg_value,
+        req.lora_name,
+        req.seed,
+        req.response_format,
+    )
+
     stream = server.generate(**generate_kwargs)
 
     first_chunk: NDArray[np.float32] | None = None
@@ -211,10 +235,21 @@ async def generate(
 
     start_t = time.perf_counter()
     ttfb_recorded = False
+    chunk_count = 0
+    total_bytes = 0
+    gen_error: BaseException | None = None
 
     async def wav_chunks() -> AsyncIterator[NDArray[np.float32]]:
+        nonlocal chunk_count
         if first_chunk is not None:
+            chunk_count += 1
             GENERATE_AUDIO_SECONDS_TOTAL.inc(float(first_chunk.shape[0]) / float(sample_rate))
+            logger.debug(
+                "/generate wav_chunk #%d: shape=%s dtype=%s",
+                chunk_count,
+                first_chunk.shape,
+                first_chunk.dtype,
+            )
             yield first_chunk
 
         if stream_exhausted:
@@ -222,10 +257,26 @@ async def generate(
 
         try:
             async for chunk in stream:
+                chunk_count += 1
                 GENERATE_AUDIO_SECONDS_TOTAL.inc(float(chunk.shape[0]) / float(sample_rate))
+                logger.debug(
+                    "/generate wav_chunk #%d: shape=%s dtype=%s",
+                    chunk_count,
+                    chunk.shape,
+                    chunk.dtype,
+                )
                 yield chunk
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
+        except Exception as exc:
+            gen_error = exc  # noqa: F841 — read by body() for diagnostics
+            logger.error(
+                "/generate: server.generate() raised %s: %s",
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            raise
 
     if req.response_format == "pcm":
         audio_stream = stream_pcm(request=request, wav_chunks=wav_chunks())
@@ -242,15 +293,51 @@ async def generate(
         audio_encoding = "mp3"
 
     async def body() -> AsyncIterator[bytes]:
-        nonlocal ttfb_recorded
-        async for b in audio_stream:
-            if not ttfb_recorded:
-                GENERATE_TTFB_SECONDS.observe(time.perf_counter() - start_t)
-                ttfb_recorded = True
-            GENERATE_STREAM_BYTES_TOTAL.inc(len(b))
-            yield b
+        nonlocal ttfb_recorded, total_bytes
+        try:
+            async for b in audio_stream:
+                if not ttfb_recorded:
+                    GENERATE_TTFB_SECONDS.observe(time.perf_counter() - start_t)
+                    ttfb_recorded = True
+                total_bytes += len(b)
+                GENERATE_STREAM_BYTES_TOTAL.inc(len(b))
+                yield b
+        except Exception as exc:
+            logger.error(
+                "/generate body() error after %d bytes, %d wav chunks: %s: %s",
+                total_bytes,
+                chunk_count,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            # Don't re-raise — StreamingResponse will just close the connection.
+            # The error is already logged.
+
         if not ttfb_recorded:
             GENERATE_TTFB_SECONDS.observe(time.perf_counter() - start_t)
+
+        elapsed_ms = round((time.perf_counter() - start_t) * 1000)
+        if total_bytes == 0:
+            logger.warning(
+                "/generate: EMPTY RESPONSE — 0 %s bytes after %dms, "
+                "%d wav chunks, gen_error=%s. "
+                "Likely cause: prompt_len + max_generate_length (%d) > max_model_len. "
+                "Check container NANOVLLM_SERVERPOOL_MAX_MODEL_LEN.",
+                audio_encoding,
+                elapsed_ms,
+                chunk_count,
+                gen_error,
+                req.max_generate_length,
+            )
+        else:
+            logger.info(
+                "/generate: streamed %d %s bytes in %dms (%d wav chunks)",
+                total_bytes,
+                audio_encoding,
+                elapsed_ms,
+                chunk_count,
+            )
 
     return StreamingResponse(
         body(),
