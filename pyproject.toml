@@ -9,7 +9,7 @@ authors = [{ name = "Guoyang Zeng" }]
 classifiers = ["License :: OSI Approved :: MIT License"]
 readme = "README.md"
 description = "VoxCPM inference engine based on Nano-vLLM"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.11"
 dependencies = [
     "torch>=2.5.0,!=2.6.*",
     "triton>=3.0.0; sys_platform != 'win32'",
@@ -20,8 +20,8 @@ dependencies = [
     "tqdm",
     "numpy",
     "librosa",
-    "pydantic",    
-    "flash_attn ; sys_platform != 'win32'",
+    "pydantic",
+    "flash-attn==2.8.3.post1+cu.13.2.torch.2.14 ; sys_platform != 'win32'",
     "soundfile>=0.13.1",
     "torchcodec",
 ]
@@ -120,15 +120,20 @@ module = [
 ]
 ignore_errors = true
 
-[tool.uv.extra-build-dependencies]
-flash-attn = [
-    { requirement = "torch", match-runtime = true },
-    "setuptools",
-    "wheel",
-    "psutil",
-    "packaging",
-    "ninja",
-]
+# torch/torchvision/torchaudio/triton are excluded from uv's resolution and
+# installation entirely - the deployment Dockerfile creates the project venv
+# with --system-site-packages, so these resolve from the base image's own
+# pre-installed CUDA build instead of being re-downloaded (several GB).
+[tool.uv]
+exclude-dependencies = ["torch", "torchvision", "torchaudio", "triton"]
+
+[[tool.uv.index]]
+name = "astral-flash-attn"
+url = "https://wheels.astral.sh/simple/cu132/"
+explicit = true
+
+[tool.uv.sources]
+flash-attn = { index = "astral-flash-attn" }
 
 [tool.uv.workspace]
 members = ["deployment"]
