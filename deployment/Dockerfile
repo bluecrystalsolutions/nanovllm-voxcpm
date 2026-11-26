@@ -9,7 +9,8 @@ ARG TORCH_CUDA_ARCH_LIST
 ENV DEBIAN_FRONTEND=noninteractive \
     TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     UV_NO_PROGRESS=1 \
-    UV_BREAK_SYSTEM_PACKAGES=1
+    UV_BREAK_SYSTEM_PACKAGES=1 \
+    UV_LINK_MODE=copy
 
 WORKDIR /app
 
@@ -53,7 +54,7 @@ COPY --chown=appuser:appuser . .
 RUN uv venv --system-site-packages .venv --python /usr/bin/python3
 
 # Install workspace packages from the frozen lockfile into that venv.
-RUN uv sync --all-packages --no-dev -v --compile-bytecode --no-cache --no-editable --inexact
+RUN uv sync --all-packages --no-dev --compile-bytecode --no-cache --no-editable --inexact
 
 EXPOSE 8000
 
